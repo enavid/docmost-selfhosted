@@ -1,0 +1,227 @@
+# ==============================================================================
+# Docmost — Collaborative Wiki & Documentation Platform
+# https://docmost.youdomain.com
+#
+# Services:
+#   - docmost   : application server (port 3000 internal)
+#   - postgres  : database
+#   - redis     : cache and session store
+#   - nginx     : TLS termination, exposed on 8070:80 and 8470:443
+#
+# Start : docker compose up -d
+# Stop  : docker compose down
+# Logs  : docker compose logs -f docmost
+# ==============================================================================
+
+services:
+  # ============================================================================
+  # Docmost Application
+  # Listens on port 3000 internally. Not exposed to host.
+  # ============================================================================
+  docmost:
+    image: docmost/docmost:latest
+    container_name: docmost
+    hostname: docmost
+    restart: unless-stopped
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+    expose:
+      - "3000"
+
+    environment:
+      APP_URL: "${APP_URL:-https://docmost.yourdomain.com}"
+      APP_SECRET: "${APP_SECRET}"
+
+      DATABASE_URL: "postgresql://${POSTGRES_USER:-docmost}:${POSTGRES_PASSWORD}@docmost-postgres:5432/${POSTGRES_DB:-docmost}?schema=public"
+      REDIS_URL: "redis://docmost-redis:6379"
+
+      # Mail — optional, leave empty to disable
+      MAIL_DRIVER: "${MAIL_DRIVER:-}"
+      SMTP_HOST: "${SMTP_HOST:-}"
+      SMTP_PORT: "${SMTP_PORT:-587}"
+      SMTP_USERNAME: "${SMTP_USERNAME:-}"
+      SMTP_PASSWORD: "${SMTP_PASSWORD:-}"
+      MAIL_FROM_ADDRESS: "${MAIL_FROM_ADDRESS:-}"
+      MAIL_FROM_NAME: "${MAIL_FROM_NAME:-Docmost}"
+
+      TZ: Asia/Tehran
+
+    volumes:
+      - docmost_storage:/app/data/storage
+      - /etc/localtime:/etc/localtime:ro
+
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "timeout 10s bash -c ':> /dev/tcp/127.0.0.1/3000' || exit 1",
+        ]
+      interval: 30s
+      timeout: 15s
+      retries: 5
+      start_period: 90s
+
+    deploy:
+      resources:
+        limits:
+          memory: ${DOCMOST_MEMORY_LIMIT:-1G}
+          cpus: "${DOCMOST_CPU_LIMIT:-1.0}"
+        reservations:
+          memory: ${DOCMOST_MEMORY_RESERVATION:-512M}
+          cpus: "${DOCMOST_CPU_RESERVATION:-0.25}"
+
+    networks:
+      - docmost-internal
+
+  # ============================================================================
+  # PostgreSQL Database
+  # Internal only — not accessible outside docmost-internal network
+  # ============================================================================
+  postgres:
+    image: postgres:16-alpine
+    container_name: docmost-postgres
+    hostname: docmost-postgres
+    restart: unless-stopped
+
+    expose:
+      - "5432"
+
+    environment:
+      POSTGRES_DB: "${POSTGRES_DB:-docmost}"
+      POSTGRES_USER: "${POSTGRES_USER:-docmost}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD}"
+      TZ: Asia/Tehran
+
+    volumes:
+      - docmost_db:/var/lib/postgresql/data
+      - /etc/localtime:/etc/localtime:ro
+
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${POSTGRES_USER:-docmost} -d ${POSTGRES_DB:-docmost}",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+    deploy:
+      resources:
+        limits:
+          memory: ${POSTGRES_MEMORY_LIMIT:-512M}
+          cpus: "${POSTGRES_CPU_LIMIT:-0.5}"
+        reservations:
+          memory: ${POSTGRES_MEMORY_RESERVATION:-256M}
+          cpus: "${POSTGRES_CPU_RESERVATION:-0.25}"
+
+    networks:
+      - docmost-internal
+
+  # ============================================================================
+  # Redis — Cache and Session Store
+  # Internal only — not accessible outside docmost-internal network
+  # ============================================================================
+  redis:
+    image: redis:7.2-alpine
+    container_name: docmost-redis
+    hostname: docmost-redis
+    restart: unless-stopped
+
+    expose:
+      - "6379"
+
+    volumes:
+      - docmost_redis:/data
+      - /etc/localtime:/etc/localtime:ro
+
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+    deploy:
+      resources:
+        limits:
+          memory: ${REDIS_MEMORY_LIMIT:-256M}
+          cpus: "${REDIS_CPU_LIMIT:-0.25}"
+        reservations:
+          memory: ${REDIS_MEMORY_RESERVATION:-128M}
+          cpus: "${REDIS_CPU_RESERVATION:-0.1}"
+
+    networks:
+      - docmost-internal
+
+  # ============================================================================
+  # Nginx — TLS Termination
+  # Exposed on 8070 (HTTP redirect) and 8470 (HTTPS)
+  # Proxies traffic to docmost:3000
+  # ============================================================================
+  nginx:
+    image: nginx:alpine
+    container_name: docmost-nginx
+    hostname: docmost-nginx
+    restart: unless-stopped
+
+    depends_on:
+      docmost:
+        condition: service_healthy
+
+    ports:
+      - "8070:80"
+      - "8470:443"
+
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./certs/fullchain.pem:/etc/nginx/ssl/fullchain.pem:ro
+      - ./certs/privkey.pem:/etc/nginx/ssl/privkey.pem:ro
+
+    healthcheck:
+      test: ["CMD-SHELL", "nginx -t || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+          cpus: "0.25"
+        reservations:
+          memory: 64M
+          cpus: "0.1"
+
+    networks:
+      - docmost-internal
+
+# ==============================================================================
+# Networks
+# Fully isolated — no shared network with other stacks on this server
+# ==============================================================================
+networks:
+  docmost-internal:
+    driver: bridge
+    name: docmost-internal
+
+# ==============================================================================
+# Volumes
+# ==============================================================================
+volumes:
+  docmost_storage:
+    driver: local
+    name: docmost_storage
+  docmost_db:
+    driver: local
+    name: docmost_db
+  docmost_redis:
+    driver: local
+    name: docmost_redis
